@@ -24,7 +24,7 @@ class OTGWSerialClient(OTGWClient):
             baudrate=self._args.get('baudrate', 9600),
             bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE, timeout=0.1)
-
+        
     def close(self):
         r"""
         Close the serial connection
@@ -44,4 +44,9 @@ class OTGWSerialClient(OTGWClient):
         """
         if(self._serial.timeout != timeout):
             self._serial.timeout = timeout
-        return self._serial.read(128).decode('ascii', 'ignore')
+
+        try:
+            return self._serial.read(128).decode('ascii', 'ignore')
+        except Exception:
+            log.debug("Invalid response from serial read cycle")
+            return "invalid"

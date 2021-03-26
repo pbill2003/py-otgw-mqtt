@@ -1,6 +1,8 @@
 import re
-from threading import Lock, Thread
+from threading import Thread
+from time import sleep
 import logging
+import collections
 
 log = logging.getLogger(__name__)
 
@@ -10,7 +12,8 @@ topic_namespace="value/otgw"
 
 # Parse hex string to int
 def hex_int(hex):
-    return int(hex, 16)
+    val = int(hex, 16)
+    return -(~val + 1)
 
 # Pre-compile a regex to parse valid OTGW-messages
 line_parser = re.compile(
@@ -29,13 +32,19 @@ def flags_msg_generator(ot_id, val):
     Returns a generator for the messages
     """
     yield ("{}/{}".format(topic_namespace, ot_id), val, )
-    if(ot_id == "flame_status"):
-        yield ("{}/flame_status_ch".format(topic_namespace),
+    if(ot_id == "boiler_status"):
+        yield ("{}/fault".format(topic_namespace),
+               val & ( 1 << 0 ) > 0, )
+        yield ("{}/ch_active".format(topic_namespace),
                val & ( 1 << 1 ) > 0, )
-        yield ("{}/flame_status_dhw".format(topic_namespace),
+        yield ("{}/dhw_active".format(topic_namespace),
                val & ( 1 << 2 ) > 0, )
-        yield ("{}/flame_status_bit".format(topic_namespace),
+        yield ("{}/flame_status".format(topic_namespace),
                val & ( 1 << 3 ) > 0, )
+        yield ("{}/ch_enabled".format(topic_namespace),
+               val & ( 1 << 8 ) > 0, )
+        yield ("{}/dhw_enabled".format(topic_namespace),
+               val & ( 1 << 9 ) > 0, )
 
 def float_msg_generator(ot_id, val):
     r"""
@@ -60,6 +69,7 @@ def get_messages(message):
     Returns a generator for the messages
     """
     info = line_parser.match(message)
+    log.debug("Message is: '{}'".format(message))
     if info is None:
         if message:
             log.debug("Did not understand message: '{}'".format(message))
@@ -68,40 +78,35 @@ def get_messages(message):
         map(lambda f, d: f(d),
             (str, lambda _: hex_int(_) & 7, hex_int, hex_int, hex_int),
             info.groups())
-    if source not in ('B', 'T', 'A') \
-        or ttype not in (1,4) \
+    if source not in ('B', 'T') \
+        or ttype not in (1,4,5) \
         or did not in opentherm_ids:
         return iter([])
     id_name, parser = opentherm_ids[did]
+    if source == 'T':
+        id_name = "evohome_" + id_name
+    elif source == 'B':
+        id_name = "boiler_" + id_name
+    else:
+        id_name = "unknown_" + id_name
     return parser(id_name, data)
 
-
+#    if source not in ('B', 'T', 'A') \
+#    if source not in ('B') \	
 # Map the opentherm ids (named group 'id' in the line parser regex) to
 # discriptive names and message creators. I put this here because the
 # referenced generators have to be assigned first
 opentherm_ids = {
-	0:   ("flame_status",flags_msg_generator,),
-	1:   ("control_setpoint",float_msg_generator,),
-	9:   ("remote_override_setpoint",float_msg_generator,),
+	0:   ("status",flags_msg_generator,),
+	1:   ("setpoint",float_msg_generator,),
 	14:  ("max_relative_modulation_level",float_msg_generator,),
-	16:  ("room_setpoint",float_msg_generator,),
 	17:  ("relative_modulation_level",float_msg_generator,),
-	18:  ("ch_water_pressure",float_msg_generator,),
-	24:  ("room_temperature",float_msg_generator,),
-	25:  ("boiler_water_temperature",float_msg_generator,),
+	18:  ("water_pressure",float_msg_generator,),
+	25:  ("water_temperature",float_msg_generator,),
 	26:  ("dhw_temperature",float_msg_generator,),
 	27:  ("outside_temperature",float_msg_generator,),
 	28:  ("return_water_temperature",float_msg_generator,),
-	56:  ("dhw_setpoint",float_msg_generator,),
-	57:  ("max_ch_water_setpoint",float_msg_generator,),
-	116: ("burner_starts",int_msg_generator,),
-	117: ("ch_pump_starts",int_msg_generator,),
-	118: ("dhw_pump_starts",int_msg_generator,),
-	119: ("dhw_burner_starts",int_msg_generator,),
-	120: ("burner_operation_hours",int_msg_generator,),
-	121: ("ch_pump_operation_hours",int_msg_generator,),
-	122: ("dhw_pump_valve_operation_hours",int_msg_generator,),
-	123: ("dhw_burner_operation_hours",int_msg_generator,)
+	115: ("oem_fault_code",int_msg_generator,),
 }
 
 class OTGWClient(object):
@@ -116,6 +121,7 @@ class OTGWClient(object):
         self._worker_running = False
         self._listener = listener
         self._worker_thread = None
+        self._send_buffer = collections.deque()
 
     def open(self):
         r"""
@@ -162,9 +168,15 @@ class OTGWClient(object):
 
     def join(self):
         r"""
-        Block until the worker thread finishes
+        Block until the worker thread finishes or exit signal received
         """
-        self._worker_thread.join()
+        try:
+            while self._worker_thread.isAlive():
+                self._worker_thread.join(1)
+        except SignalExit:
+            self.stop()
+        except SignalAlarm:
+            self.reconnect()
 
     def start(self):
         r"""
@@ -174,6 +186,7 @@ class OTGWClient(object):
             raise RuntimeError("Already running")
         self._worker_thread = Thread(target=self._worker)
         self._worker_thread.start()
+        log.info("Started worker thread #%s", self._worker_thread.ident)
 
     def stop(self):
         r"""
@@ -181,15 +194,42 @@ class OTGWClient(object):
         """
         if not self._worker_thread:
             raise RuntimeError("Not running")
+        log.info("Stopping worker thread #%s", self._worker_thread.ident)
         self._worker_running = False
-        self.join()
+        self._worker_thread.join()
+
+    def reconnect(self, reconnect_pause=10):
+        r"""
+        Attempt to reconnect when the connection is lost
+        """
+        try:
+            self.close()
+        except Exception:
+            pass
+
+        while self._worker_running:
+            try:
+                self.open()
+                self._listener((topic_namespace, 'online'))
+                break
+            except Exception:
+                self._listener((topic_namespace, 'offline'))
+                log.warning("Waiting %d seconds before retrying", reconnect_pause)
+                sleep(reconnect_pause)
+
+    def send(self, data):
+        self._send_buffer.append(data)
 
     def _worker(self):
         # _worker_running should be True while the worker is running
         self._worker_running = True
 
-        # Open the connection to the OTGW
-        self.open()
+        try:
+          # Open the connection to the OTGW
+           self.open()
+        except ConnectionException:
+           log.warning("Retrying immediately")
+           self.reconnect()
 
         # Compile a regex that will only match the first part of a string, up
         # to and including the first time a line break and/or carriage return
@@ -201,9 +241,17 @@ class OTGWClient(object):
         data = ""
 
         while self._worker_running:
-            # Call the read method of the implementation
-            data += self.read(timeout=0.5)
-
+            try:
+                # Send MQTT messages to TCP serial
+                while self._send_buffer:
+                    self.write(self._send_buffer[0])
+                    self._send_buffer.popleft()
+                # Receive TCP serial data for MQTT
+                read = self.read(timeout=0.5)
+                if read:
+                    data += read
+            except ConnectionException:
+                self.reconnect()
             # Find all the lines in the read data
             while True:
                 m = line_splitter.match(data)
@@ -221,7 +269,7 @@ class OTGWClient(object):
                     except Exception as e:
                         # Log a warning when an exception occurs in the
                         # listener
-                        log.warn(str(e))
+                        log.warning(str(e))
 
                 # Strip the consumed line from the buffer
                 data = data[m.end():]
@@ -229,3 +277,19 @@ class OTGWClient(object):
         # After the read loop, close the connection and clean up
         self.close()
         self._worker_thread = None
+
+class ConnectionException(Exception):
+    pass
+
+class SignalExit(Exception):
+    """
+    Custom exception which is used to trigger the clean exit
+    of all running threads and the main program.
+    """
+    pass
+
+class SignalAlarm(Exception):
+    """
+    Custom exception upon trigger of SIGALRM signal
+    """
+    pass

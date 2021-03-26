@@ -6,7 +6,7 @@
     },
     "mqtt" : {
         "client_id": "otgw",
-        "host": "127.0.0.1",
+        "host": "hassbian.localdomain",
         "port": 1883,
         "keepalive": 60,
         "bind_address": "",

@@ -1,12 +1,14 @@
 [Unit]
 Description=Python OTGW MQTT bridge
-After=network.target
+After=network-online.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/usr/lib/py-otgw-mqtt
-ExecStart=/usr/bin/python .
+WorkingDirectory=/home/pi/py-otgw-mqtt
+ExecStart=/usr/bin/python3 .
+Restart=on-failure
+RestartSec=30s
 
 [Install]
 WantedBy=multi-user.target
