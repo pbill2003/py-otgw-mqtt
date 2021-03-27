@@ -106,6 +106,7 @@ opentherm_ids = {
 	26:  ("dhw_temperature",float_msg_generator,),
 	27:  ("outside_temperature",float_msg_generator,),
 	28:  ("return_water_temperature",float_msg_generator,),
+	57:  ("max_ch_water_setpoint",float_msg_generator,),
 	115: ("oem_fault_code",int_msg_generator,),
 }
 
